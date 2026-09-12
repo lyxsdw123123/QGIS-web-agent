@@ -1,0 +1,257 @@
+================================================================================
+QGIS Web Agent MVP —— 项目架构与进度说明
+================================================================================
+
+本文件是对「D:\论文\qgis-web-agent-mvp」项目的架构梳理与当前进度记录。
+项目目标：极简复现 https://wing-show.com/projects/qgis-web-agent/ 的核心能力，
+即「自然语言 → 服务器端真实地理计算 → 结果上图可下载」。
+
+设计原则：只保留核心链路，不做降级与回退。
+  - 大模型不可用时直接报错，不提供规则识别替代方案
+  - 地理计算只走真实 QGIS，不做纯 Python 引擎回退
+
+
+================================================================================
+一、当前进度总览
+================================================================================
+
+【已完成】
+  1. 项目骨架搭建（目录、requirements.txt、README.md、.gitignore）
+  2. 示例道路数据生成（data/sample_roads.geojson，60 条线）
+  3. GIS 引擎：QGIS 3.44.14 真实计算（qgis_process + native 算法）
+  4. 智能体层：通义千问 function calling（工具 buffer / total_length）
+  5. FastAPI 后端（图层 CRUD、对话、示例加载、上传、静态前端服务）
+  6. 前端单页（Leaflet 地图 + 聊天框 + 图层面板）
+  7. 通义千问 API 打通，真实 LLM + 真实 QGIS 全链路验证通过
+  8. 移除全部降级代码（LLM 规则识别替代 + GeoPandas 引擎回退）
+
+【待办】
+  1. 可选：新增「沿线采样」工具（补齐原项目缓冲/采样/统计三件套）
+  2. 可选：SSE 流式（工具卡片实时推进）
+  3. 可选：写论文用「系统实现」描述
+
+
+================================================================================
+二、总体架构
+================================================================================
+
+浏览器（Leaflet + OSM 底图 + 聊天 + 图层面板）
+        │  fetch（JSON / GeoJSON / multipart）
+        ▼
+FastAPI 后端（main.py：路由、.env 加载、静态服务）
+        │
+        ├── 图层存储 store.py（内存 dict，重启即清空）
+        │
+        └── 智能体 agent.py
+              │  通义千问 Qwen（OpenAI 兼容接口，function calling）
+              ▼
+            工具 buffer / total_length
+              │
+              ▼
+        GIS 引擎 engine.py（QgisEngine）
+              └── qgis_process + native:reprojectlayer / native:buffer
+              │
+              ▼
+        输出 GeoJSON → 返回前端上图、可下载
+
+
+一次对话的完整流程：
+  1. 前端 POST /api/chat {text}
+  2. agent 组装系统提示（含当前图层 id 列表）+ 用户消息
+  3. 调 Qwen（qwen-plus）function calling，模型决定是否调用工具
+  4. 若调用工具 → 执行 buffer/total_length → 结果回填 → 再问模型
+  5. 模型给出最终中文答复 + 工具调用日志 → 返回前端
+  6. 前端刷新图层列表，新增图层上图
+
+
+================================================================================
+三、目录结构
+================================================================================
+
+qgis-web-agent-mvp/
+├── backend/
+│   ├── __init__.py
+│   ├── main.py      # FastAPI 路由 + .env 加载 + 静态前端服务
+│   ├── agent.py     # 工具定义 + Qwen function calling
+│   ├── engine.py    # QgisEngine（qgis_process 调用）
+│   └── store.py     # 内存图层存储（LayerStore）
+├── frontend/
+│   └── index.html   # Leaflet + 聊天 + 图层面板（单文件，无构建）
+├── scripts/
+│   ├── make_sample.py  # 生成示例道路 GeoJSON
+│   └── check_qgis.py   # 验证 QGIS 引擎（调用应用实际使用的引擎）
+├── data/
+│   └── sample_roads.geojson  # 示例数据（运行 make_sample.py 生成）
+├── .env             # DASHSCOPE_API_KEY、QGIS_PROCESS_PATH（已 gitignore）
+├── .gitignore
+├── requirements.txt
+└── README.md
+
+
+================================================================================
+四、模块说明
+================================================================================
+
+【backend/store.py】内存图层存储
+  - 单用户、进程内 dict，重启即清空
+  - 方法：add / get / meta / list / delete
+  - 每图层：id（uuid 12 位）、name、geojson、feature_count、layer_type
+
+【backend/engine.py】地理计算
+  - QgisEngine：通过 qgis_process 调用 QGIS 原生算法
+      .buffer(geojson, distance_m) 执行三步链路：
+        native:reprojectlayer（→ 米制 CRS）
+        native:buffer（DISTANCE 单位与图层 CRS 一致）
+        native:reprojectlayer（→ EPSG:4326）
+      QGIS 入口由 QGIS_PROCESS_PATH 指定，额外参数由 QGIS_PROCESS_FLAGS 指定
+  - compute_total_length(geojson)：线图层总长度（米）
+      长度是平凡度量，直接用 GeoPandas 计算，不必走 QGIS
+  - create_engine()：按环境变量构造 QgisEngine
+  - METRIC_CRS = "EPSG:3857"（可改 EPSG:4525 提高国内精度）
+  - 命令语法已对照 QGIS 3.44 确认：qgis_process run <算法> -- PARAM=VALUE
+
+【backend/agent.py】智能体层
+  - 工具清单 TOOLS：buffer（缓冲区）、total_length（长度统计）
+  - _system_prompt()：把当前图层 id 列表注入系统提示
+  - _run_tool()：工具分发执行（buffer 生成新图层；total_length 返回数值）
+  - chat()：OpenAI 兼容接口调 Qwen，function calling 循环（最多 6 轮）
+
+【backend/main.py】FastAPI 后端
+  - _load_env()：启动时读取根目录 .env（setdefault，已存在的环境变量不覆盖）
+  - 路由见第五节
+  - 最后挂载 StaticFiles 服务前端（放在 /api 路由之后，避免遮蔽）
+
+【frontend/index.html】前端单页
+  - Leaflet 1.9.4（CDN）+ OSM 底图
+  - 聊天框：发送 / Enter 发送 / Shift+Enter 换行
+  - 图层面板：隐藏、定位、下载、删除
+  - 工具栏：加载示例道路、上传 GeoJSON
+  - boot()：读 /api/config 显示「引擎 / 模型 / 是否连接 LLM」徽标
+
+
+================================================================================
+五、API 接口清单
+================================================================================
+
+GET    /api/config                          → {engine, model, has_api_key}
+GET    /api/layers                          → {layers: [...]}
+GET    /api/layers/{id}/data.geojson        → 图层 GeoJSON
+GET    /api/layers/{id}/download            → 下载（中文文件名走 RFC 5987）
+DELETE /api/layers/{id}                     → 删除图层
+POST   /api/layers                          → 上传单个 GeoJSON（multipart）
+POST   /api/demo/load                        → 加载示例道路
+POST   /api/chat                            → {reply, tool_logs}
+GET    /                                    → 前端页面
+
+
+================================================================================
+六、Agent 工具清单
+================================================================================
+
+1. buffer
+   - 描述：对指定图层做缓冲区分析，distance_m 单位米
+   - 参数：layer_id（string）、distance_m（number）
+   - 返回：{ok, new_layer_id, feature_count}
+
+2. total_length
+   - 描述：统计线图层所有要素的总长度（米）
+   - 参数：layer_id（string）
+   - 返回：{ok, total_length_m, total_length_km, feature_count}
+
+
+================================================================================
+七、配置项
+================================================================================
+
+配置文件：项目根目录 .env（已 gitignore）
+
+  DASHSCOPE_API_KEY = sk-ws-...      # 通义千问 key（已验证可用）
+  QGIS_PROCESS_PATH = D:\Program Files\QGIS 3.44.14\bin\qgis_process-qgis-ltr.bat
+
+可选环境变量：
+
+  QGIS_PROCESS_FLAGS = ...                   # 追加给 qgis_process 的参数（默认空）
+  QGIS_WEB_AGENT_MODEL = qwen-plus           # 覆盖模型名
+
+代码内常量：
+  DASHSCOPE_BASE_URL = https://dashscope.aliyuncs.com/compatible-mode/v1
+  METRIC_CRS = "EPSG:3857"
+
+
+================================================================================
+八、已验证结果
+================================================================================
+
+【A. QGIS 引擎（scripts/check_qgis.py）】通过 [OK]
+  - QGIS 3.44.14-Solothurn，入口
+    D:\Program Files\QGIS 3.44.14\bin\qgis_process-qgis-ltr.bat
+  - 单线缓冲 → 输出 1 要素，几何类型 MultiPolygon
+
+【B. 真实 LLM + 真实 QGIS + 完整应用链路】通过 [OK]
+  - 引擎 = qgis_process；/api/config = {engine: qgis_process, model: qwen-plus,
+    has_api_key: True}
+  - 加载示例道路 60 要素
+  - 对话（自然语言）：「把示例道路往两边各扩 200 米」
+  - LLM 正确解析为 buffer(layer_id=..., distance_m=200)
+  - 生成图层「示例道路（武汉）缓冲200米」，60 要素，耗时 9.0 秒
+  - 响应字段为 {reply, tool_logs}（已无降级相关的 mock 字段）
+
+修复过的 bug：
+  1. 下载接口 Content-Disposition 头带中文文件名导致 latin-1 编码崩溃，
+     改用 filename*=UTF-8''...（RFC 5987）
+  2. 引擎探测与执行命令名不一致（qgis_process vs qgis_process-qgis-ltr.bat），
+     改为显式路径（QGIS_PROCESS_PATH）
+  3. 【真实 QGIS 环境暴露】重投影算法 id 写错：native:reproject 不存在，
+     正确为 native:reprojectlayer。已修正并验证。
+  4. 【key 抄写错误】.env 中的 DASHSCOPE_API_KEY 末尾多抄了一个字符
+     （把用户消息里列表序号「2.」误当成 key 内容），导致 401 invalid_api_key。
+     已修正并验证：正确 key 长度 115，错误 key 长度 116。
+
+
+================================================================================
+九、与原项目（wing-show qgis-web-agent）对比
+================================================================================
+
+已复现（MVP 简化版）：
+  - 自然语言 → 服务器端真实计算 → 结果上图可下载 的核心链路
+  - Leaflet + 聊天 + 图层面板的前端形态
+  - LLM function calling + 工具化（不让模型直接写代码）
+  - 真实 QGIS 执行地理处理（qgis_process + native 算法）
+  - buffer / 长度统计（对应原项目 缓冲 / 几何统计）
+
+已明确简化（MVP 未做）：
+  - 无 SSE 流式（用同步请求 + 事后刷新图层列表）
+  - 无框选/点选 → 临时图层机制
+  - 无 shapefile 多文件上传、栅格、DEM、坡度坡向、山体阴影
+  - 无 MCP 协议（单入口用普通 function calling 即可）
+  - 无会话管理、鉴权、并发队列
+  - 底图用 OSM（原项目用天地图/百度，需 key 与火星坐标纠偏）
+
+
+================================================================================
+十、运行方式
+================================================================================
+
+  1) 启动服务（注意：直接用 uvicorn 命令可能因 PATH 未配置而找不到，
+     推荐用 python -m uvicorn）：
+
+     cd D:\论文\qgis-web-agent-mvp
+     python -m uvicorn backend.main:app --reload --port 8000
+
+     浏览器打开 http://127.0.0.1:8000
+
+  2) 首次生成示例数据（已生成过可跳过）：
+
+     python scripts/make_sample.py
+
+  3) 验证 QGIS 引擎：
+
+     python scripts/check_qgis.py
+
+  4) 若想以后直接敲 uvicorn，把 D:\Anaconda\Scripts 加入 PATH
+     （qgis_process 本项目已用绝对路径，不依赖 PATH）
+
+
+================================================================================
+（完）
+================================================================================
