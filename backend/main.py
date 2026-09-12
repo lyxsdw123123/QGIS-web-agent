@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -42,7 +42,7 @@ _load_env()
 
 store = LayerStore()
 engine = engine_mod.create_engine()
-agent = Agent(store, engine)
+agent = Agent(store, engine, DATA_DIR)
 
 app = FastAPI(title="QGIS Web Agent MVP")
 
@@ -70,9 +70,18 @@ def list_layers():
 @app.get("/api/layers/{lid}/data.geojson")
 def layer_data(lid: str):
     layer = store.get(lid)
-    if layer is None:
-        raise HTTPException(404, "图层不存在")
+    if layer is None or layer.get("layer_type") != "vector":
+        raise HTTPException(404, "矢量图层不存在")
     return JSONResponse(layer["geojson"])
+
+
+@app.get("/api/layers/{lid}/file")
+def layer_file(lid: str):
+    """栅格图层的图片（浏览器不能显示 GeoTIFF，统一转成 PNG）。"""
+    layer = store.get(lid)
+    if layer is None or layer.get("layer_type") != "raster":
+        raise HTTPException(404, "栅格图层不存在")
+    return FileResponse(layer["png_path"], media_type="image/png")
 
 
 @app.get("/api/layers/{lid}/download")
@@ -80,9 +89,13 @@ def layer_download(lid: str):
     layer = store.get(lid)
     if layer is None:
         raise HTTPException(404, "图层不存在")
+    name = layer["name"]
+    if layer.get("layer_type") == "raster":
+        return FileResponse(layer["png_path"], media_type="image/png",
+                            filename=f"{name}.png")
     # header 只能用 latin-1，中文文件名走 RFC 5987 的 filename*=UTF-8''...
     safe = f"{lid}.geojson"
-    utf8_name = quote(f"{layer['name']}.geojson")
+    utf8_name = quote(f"{name}.geojson")
     headers = {"Content-Disposition": f"attachment; filename=\"{safe}\"; filename*=UTF-8''{utf8_name}"}
     return JSONResponse(layer["geojson"], headers=headers)
 

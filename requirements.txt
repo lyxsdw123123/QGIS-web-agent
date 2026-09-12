@@ -3,3 +3,6 @@ uvicorn
 openai
 geopandas
 shapely
+numpy
+rasterio
+pillow

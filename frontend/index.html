@@ -102,6 +102,18 @@ function addMsg(role, text) {
 async function addLayer(meta) {
   if (layerGeos[meta.id]) return;
   layerMetas[meta.id] = meta;
+  if (meta.layer_type === 'raster') {
+    // 栅格以图片叠加显示：后端已把 GeoTIFF 转成 PNG，这里配上经纬度范围
+    const ov = L.imageOverlay(`/api/layers/${meta.id}/file`, meta.bounds,
+                              { opacity: 0.85 });
+    ov.addTo(map);
+    layerGeos[meta.id] = ov;
+    try { map.fitBounds(meta.bounds); } catch (e) {}
+    renderLayers();
+    return;
+  }
+  // 投影坐标（米）不能叠加在经纬度底图上，只登记到图层列表
+  if (meta.crs && meta.crs !== 'EPSG:4326') { renderLayers(); return; }
   const geo = await api(`/api/layers/${meta.id}/data.geojson`);
   const gl = L.geoJSON(geo, { style: { color: '#1f5f8a', weight: 3 } });
   gl.addTo(map);
@@ -126,7 +138,10 @@ function renderLayers() {
     row.className = 'layer-row';
     const name = document.createElement('span');
     name.className = 'name';
-    name.innerHTML = `${escapeHtml(l.name)} <em>${l.feature_count}要素</em>`;
+    const info = l.layer_type === 'raster'
+      ? '栅格'
+      : `${l.feature_count}要素${(l.crs && l.crs !== 'EPSG:4326') ? ' · ' + l.crs : ''}`;
+    name.innerHTML = `${escapeHtml(l.name)} <em>${info}</em>`;
     name.title = `id=${l.id}`;
     const eye = document.createElement('button');
     eye.textContent = '隐藏';
