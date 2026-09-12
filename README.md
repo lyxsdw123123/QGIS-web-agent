@@ -1,6 +1,6 @@
 # QGIS Web Agent MVP
 
-对 [wing-show.com/projects/qgis-web-agent](https://wing-show.com/projects/qgis-web-agent/) 的复现。
+复现自原作 [QGIS Web Agent · 对话式地理处理](https://wing-show.com/projects/qgis-web-agent/)（作者：张翼 / Wing's Space）。
 核心链路：**自然语言 → 服务器端真实 QGIS 计算 → 结果上图可下载**。
 
 设计原则：只保留核心，不做降级与回退。大模型不可用时直接报错；地理计算只走真实 QGIS。
