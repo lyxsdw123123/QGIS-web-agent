@@ -12,9 +12,10 @@ from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.concurrency import iterate_in_threadpool
 
 from . import engine as engine_mod
 from .agent import Agent, QWEN_MODEL
@@ -129,13 +130,24 @@ def load_demo():
     return store.meta(lid)
 
 
-# ---------- 对话 ----------
+# ---------- 对话（SSE 流式） ----------
+def _sse(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
 @app.post("/api/chat")
-def chat(body: ChatRequest):
+async def chat(body: ChatRequest):
     text = body.text.strip()
     if not text:
         raise HTTPException(400, "消息为空")
-    return agent.chat(text)
+
+    async def gen():
+        async for event, data in iterate_in_threadpool(agent.chat_stream(text)):
+            yield _sse(event, data)
+
+    return StreamingResponse(gen(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})
 
 
 # ---------- 前端静态（放在最后，避免遮蔽 /api 路由） ----------

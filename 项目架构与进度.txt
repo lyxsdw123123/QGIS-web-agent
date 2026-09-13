@@ -26,10 +26,10 @@ QGIS Web Agent MVP —— 项目架构与进度说明
   7. FastAPI 后端（矢量/栅格图层、对话、上传、静态前端）
   8. 前端单页（Leaflet，矢量 + 栅格图片叠加）
   9. 真实 LLM + 真实 QGIS 全链路验证通过
+ 10. SSE 流式：工具调用卡片实时推进、新图层即时上图、状态栏进度
 
 【待办】
-  1. 可选：SSE 流式（工具卡片实时推进）
-  2. 可选：写论文用「系统实现」描述
+  1. 可选：写论文用「系统实现」描述
 
 
 ================================================================================
@@ -57,13 +57,13 @@ FastAPI 后端（main.py：路由、.env 加载、静态服务）
         输出 GeoJSON 或 PNG → 返回前端上图、可下载
 
 
-一次对话的完整流程：
-  1. 前端 POST /api/chat {text}
+一次对话的完整流程（SSE 流式）：
+  1. 前端 POST /api/chat {text}（fetch + ReadableStream 消费 SSE）
   2. agent 组装系统提示（含图层清单、data 目录文件清单）+ 用户消息
   3. 调 Qwen（qwen-plus）function calling，模型决定调哪个工具
-  4. 执行工具（可能连续多轮）→ 结果回填 → 再问模型
-  5. 模型给出最终中文答复 + 工具调用日志 → 返回前端
-  6. 前端刷新图层列表，新增图层上图（矢量 GeoJSON / 栅格 imageOverlay）
+  4. 每步实时推事件：status（进度）→ tool start/end（工具卡片）
+     → layer（新图层即时上图）→ final（最终答复）→ error
+  5. 前端收到 layer 事件即把新图层叠加到地图（矢量 GeoJSON / 栅格 imageOverlay）
 
 
 ================================================================================
@@ -148,7 +148,8 @@ GET    /api/layers/{id}/download            → 下载（矢量 GeoJSON / 栅格
 DELETE /api/layers/{id}                     → 删除图层
 POST   /api/layers                          → 上传单个 GeoJSON（multipart）
 POST   /api/demo/load                        → 加载示例道路
-POST   /api/chat                            → {reply, tool_logs}
+POST   /api/chat                            → SSE 流（text/event-stream）
+                                              事件：status / tool / layer / final / error
 GET    /                                    → 前端页面
 
 
@@ -233,7 +234,6 @@ GET    /                                    → 前端页面
   - 工具化设计：模型只选工具，不写 GIS 代码
 
 已简化（未做）：
-  - 无 SSE 流式（同步请求 + 事后刷新图层列表）
   - 无框选/点选 → 临时图层机制
   - 无 shapefile 多文件上传、无 MCP 协议、无会话管理、无鉴权
   - 底图用 OSM（原项目用天地图/百度，需 key 与火星坐标纠偏）

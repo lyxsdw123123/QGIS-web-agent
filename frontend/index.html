@@ -38,6 +38,18 @@
     .msg.assistant { align-self:flex-start; background:var(--bg); border-bottom-left-radius:3px; }
     .msg.tool { align-self:flex-start; font-size:12px; color:var(--muted); }
     .msg.error { align-self:flex-start; color:#a33b32; background:#fbeceb; }
+    .tool-card { align-self:flex-start; width:92%; border:1px solid var(--line); border-radius:10px;
+      background:#fff; overflow:hidden; font-size:12px; }
+    .tool-card .tc-head { display:flex; align-items:center; gap:6px; padding:6px 10px; background:var(--bg); }
+    .tool-card .tc-name { color:var(--accent); font-weight:600; }
+    .tool-card .tc-dur { margin-left:auto; color:var(--muted); font-size:11px; }
+    .tool-card .tc-body { padding:5px 10px; color:var(--muted); word-break:break-all; font-size:11px; }
+    .tool-card.error .tc-name { color:#a33b32; }
+    .spinner { width:12px; height:12px; border:2px solid #ccc; border-top-color:var(--accent);
+      border-radius:50%; animation:spin .8s linear infinite; flex:none; }
+    @keyframes spin { to { transform:rotate(360deg); } }
+    #status-bar { padding:2px; font-size:12px; color:var(--muted); display:none; }
+    #status-bar.show { display:block; }
     #composer { padding:10px 12px; border-top:1px solid var(--line); }
     #input-bar { display:flex; gap:8px; }
     #input { flex:1; border:1px solid var(--line); border-radius:8px; padding:9px 11px; font:inherit; resize:none; outline:none; }
@@ -66,11 +78,12 @@
     <div id="chat-head">GIS 助手<small id="chat-sub">对话驱动的空间分析</small></div>
     <div id="messages"></div>
     <div id="composer">
+      <div id="status-bar"></div>
       <div id="input-bar">
-        <textarea id="input" rows="2" placeholder="例如：对示例道路做 100 米缓冲区 / 统计长度"></textarea>
+        <textarea id="input" rows="2" placeholder="例如：获取武汉市江汉区的 DEM，计算坡度和山体阴影"></textarea>
         <button id="send">发送</button>
       </div>
-      <div class="hint">MVP 支持：缓冲、长度统计。Enter 发送，Shift+Enter 换行。</div>
+      <div class="hint">支持 17 个 GIS 工具。Enter 发送，Shift+Enter 换行。</div>
     </div>
   </div>
 </div>
@@ -171,6 +184,78 @@ function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+const toolCards = {};   // tool id -> {card, dur}
+
+function prettyTool(name) {
+  const m = { buffer: '缓冲区', points_along_lines: '沿线采样', clip: '裁剪',
+    extract_by_attribute: '按属性筛选', reproject: '重投影', total_length: '长度统计',
+    field_stats: '字段统计', inspect_layer: '检查图层', layer_to_geojson: '转GeoJSON',
+    load_layer: '加载图层', get_osm_roads: 'OSM道路', get_admin_boundary: '行政区划',
+    get_dem: '获取DEM', slope: '坡度', aspect: '坡向', hillshade: '山体阴影',
+    render_png: '渲染图' };
+  return m[name] || name;
+}
+
+function showStatus(text) {
+  const s = document.getElementById('status-bar');
+  if (text) { s.textContent = '⏳ ' + text; s.classList.add('show'); }
+  else s.classList.remove('show');
+}
+
+function scrollMsgs() { const b = document.getElementById('messages'); b.scrollTop = b.scrollHeight; }
+
+function handleTool(d) {
+  if (d.phase === 'start') {
+    const card = document.createElement('div');
+    card.className = 'tool-card';
+    const head = document.createElement('div'); head.className = 'tc-head';
+    const spin = document.createElement('span'); spin.className = 'spinner';
+    const name = document.createElement('span'); name.className = 'tc-name';
+    name.textContent = prettyTool(d.name);
+    const dur = document.createElement('span'); dur.className = 'tc-dur';
+    dur.textContent = '运行中…';
+    head.append(spin, name, dur);
+    const body = document.createElement('div'); body.className = 'tc-body';
+    body.textContent = JSON.stringify(d.args);
+    card.append(head, body);
+    document.getElementById('messages').appendChild(card);
+    toolCards[d.id] = { card, dur };
+    scrollMsgs();
+  } else {
+    const c = toolCards[d.id];
+    if (!c) return;
+    c.card.classList.toggle('error', d.status !== 'ok');
+    const sp = c.card.querySelector('.spinner'); if (sp) sp.remove();
+    c.dur.textContent = (d.duration_ms / 1000).toFixed(1) + 's';
+    const r = d.result || {};
+    let sum = '';
+    if (d.status !== 'ok') sum = r.error || '执行失败';
+    else if (r.new_layer_name) sum = `生成图层「${r.new_layer_name}」`;
+    else if (r.total_length_km != null) sum = `总长 ${r.total_length_km} km`;
+    else if (r.feature_count != null) sum = `${r.feature_count} 要素`;
+    else if (r.png_url) sum = '已出图';
+    else if (r.fields) sum = `${Object.keys(r.fields).length} 个字段`;
+    if (sum) { const b = document.createElement('div'); b.className = 'tc-body'; b.textContent = sum; c.card.appendChild(b); }
+    scrollMsgs();
+  }
+}
+
+function dispatchSSE(chunk) {
+  let event = 'message', data = '';
+  for (const line of chunk.split('\n')) {
+    if (line.startsWith(':')) continue;
+    if (line.startsWith('event:')) event = line.slice(6).trim();
+    else if (line.startsWith('data:')) data += line.slice(5).trimStart();
+  }
+  if (!data) return;
+  const d = JSON.parse(data);
+  if (event === 'status') showStatus(d.text);
+  else if (event === 'tool') handleTool(d);
+  else if (event === 'layer') addLayer(d);
+  else if (event === 'final') { showStatus(''); addMsg('assistant', d.text); }
+  else if (event === 'error') { showStatus(''); addMsg('error', d.message); }
+}
+
 async function send() {
   const input = document.getElementById('input');
   const text = input.value.trim();
@@ -179,17 +264,33 @@ async function send() {
   addMsg('user', text);
   const btn = document.getElementById('send');
   btn.disabled = true;
+  showStatus('已收到，正在理解需求…');
   try {
-    const r = await api('/api/chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ text }) });
-    if (r.tool_logs && r.tool_logs.length) {
-      for (const t of r.tool_logs) addMsg('tool', `▸ 调用工具 ${t.name}(${JSON.stringify(t.args)})`);
+    const resp = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text }),
+    });
+    if (!resp.ok) { addMsg('error', 'HTTP ' + resp.status); return; }
+    const reader = resp.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\n\n')) >= 0) {
+        dispatchSSE(buf.slice(0, idx));
+        buf = buf.slice(idx + 2);
+      }
     }
-    addMsg('assistant', r.reply);
-    await refreshLayers();
   } catch (e) {
-    addMsg('error', '出错了：' + e.message);
+    showStatus('');
+    addMsg('error', '连接中断：' + e.message);
   } finally {
     btn.disabled = false;
+    showStatus('');
   }
 }
 

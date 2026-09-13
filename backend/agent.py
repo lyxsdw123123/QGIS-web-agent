@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from uuid import uuid4
 
@@ -315,8 +316,17 @@ class Agent:
             f"\ndata 目录下可加载的文件：{files}"
         )
 
-    # ---------- function calling 循环 ----------
-    def chat(self, text: str) -> dict:
+    # ---------- function calling 循环（产出 SSE 事件） ----------
+    def chat_stream(self, text: str):
+        """生成器，逐个产出 (event, data) 事件元组。
+
+        event 类型：
+          status  → {text}                    进度提示
+          tool    → {id, phase:start|end, name, args, status, duration_ms, result}
+          layer   → 图层元信息（新图层生成时）
+          final   → {text}                    最终答复
+          error   → {message}
+        """
         from openai import OpenAI
         client = OpenAI(
             api_key=os.environ.get("DASHSCOPE_API_KEY", ""), base_url=DASHSCOPE_BASE_URL)
@@ -324,24 +334,42 @@ class Agent:
             {"role": "system", "content": self._system_prompt()},
             {"role": "user", "content": text},
         ]
-        logs = []
+        yield ("status", {"text": "已收到，正在理解需求…"})
         try:
             for _ in range(6):
                 resp = client.chat.completions.create(
                     model=QWEN_MODEL, messages=messages, tools=TOOLS, tool_choice="auto")
                 msg = resp.choices[0].message
                 if not msg.tool_calls:
-                    return {"reply": msg.content or "", "tool_logs": logs}
+                    yield ("final", {"text": msg.content or ""})
+                    return
                 messages.append(msg)
                 for tc in msg.tool_calls:
                     args = json.loads(tc.function.arguments or "{}")
-                    result = self._run_tool(tc.function.name, args)
-                    logs.append({"name": tc.function.name, "args": args, "result": result})
+                    tid = uuid4().hex[:8]
+                    yield ("tool", {"id": tid, "phase": "start",
+                                    "name": tc.function.name, "args": args})
+                    t0 = time.time()
+                    result = self._run_tool(tc.function.name, args)   # JSON 字符串
+                    dur_ms = round((time.time() - t0) * 1000)
+                    try:
+                        data = json.loads(result)
+                    except Exception:
+                        data = {}
+                    status = "ok" if "error" not in data else "error"
+                    # 生成了新图层 → 立刻推给前端上图
+                    if data.get("new_layer_id"):
+                        meta = self.store.meta(data["new_layer_id"])
+                        if meta:
+                            yield ("layer", meta)
+                    yield ("tool", {"id": tid, "phase": "end",
+                                    "name": tc.function.name, "status": status,
+                                    "duration_ms": dur_ms, "result": data})
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tc.id,
                         "content": result,
                     })
-            return {"reply": "（达到最大工具调用轮数，仍未得到最终答复）", "tool_logs": logs}
+            yield ("final", {"text": "（达到最大工具调用轮数，仍未得到最终答复）"})
         except Exception as e:
-            return {"reply": f"调用大模型失败：{e}", "tool_logs": logs}
+            yield ("error", {"message": f"调用大模型失败：{e}"})
